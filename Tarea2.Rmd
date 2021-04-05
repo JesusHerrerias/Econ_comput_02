@@ -1,0 +1,689 @@
+---
+title: "**Predicción de Abandono**"
+author: "**David, Fidel, Jesús, Mónica**"
+date: "2021"
+output:
+  html_document:
+      theme: 'flatly'
+      highlight: 'zenburn'
+      code_folding: 'hide'
+urlcolor: blue
+graphics: yes
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = NA, message = FALSE,
+                      fig.width = 7, fig.height = 4, fig.align = "right")
+```
+
+```{r, warning=FALSE}
+# Librerias====
+library(tidyverse)
+library(data.table)
+library(broom)
+library(knitr)
+library(lubridate)
+library(RCT)
+library(gamlr)
+library(ranger)
+library(tree)
+library(parallel)
+library(tidymodels)
+library(caret)
+library(kableExtra)
+library(ggplot2)
+library(pROC)
+
+```
+
+
+
+## Contexto
+
+Cell2Cell es una compañía de teléfonos celulares que intenta mitigar el abandono de sus usuarios. Te contratan para 1) Encontrar un modelo que prediga el abandono con acierto y para usar los insights de este modelo para proponer una estrategia de manejo de abandono.
+
+
+Las preguntas que contestaremos son:
+
+1. Se puede predecir el abandono con los datos que nos compartieron? 
+
+2. Cuáles son las variables que explican en mayor medida el abandono? 
+
+3. Qué incentivos da Cell2Cell a sus usarios para prevenir el abandono?
+
+4. Cuál es el valor de una estrategia de prevención de abandono focalizada y cómo difiere entre los segmentos de los usuarios? Qué usuarios deberían de recibir incentivos de prevención? Qué montos de incentivos
+
+Nota: Voy a evaluar las tareas con base en la respuesta a cada pregunta. Como hay algunas preguntas que no tienen una respuesta clara, al final ponderaré de acuerdo al poder predictivo de su modelo vs las respuestas sugeridas. 
+
+
+
+\newpage
+
+## Datos
+
+Los dotos los pueden encontrar en `Cell2Cell.Rdata`. En el archivo `Cell2Cell-Database-Documentation.xlsx` pueden encontrar documentación de la base de datos. 
+
+Cargemos los datos
+```{r }
+# Lectura====
+load("data/raw/Cell2Cell.Rdata")
+
+```
+
+### 1. Qué variables tienen missing values? Toma alguna decisión con los missing values. Justifica tu respuesta
+
+Veamos una tablita con las variables que tienen NaNs.
+
+```{r, warning=FALSE}
+conteoNans <- sapply(cell2cell, function(x) sum(is.na (x))) # Contar NaNs por variable
+ratioNans  <- conteoNans / nrow(cell2cell) # Número de NaNs entre nObservaciones
+
+(ratioNans[ratioNans > 0] * 100) %>% as.data.frame()
+```
+
+En caso de que fueran categóricas, generaríamos una nueva categoría (e.g. 'Otros'). Sin embargo, con variables numéricas asignar la media permitiría que la distribuciòn no se moviera en promedio.
+
+Asignémosle la media a estas variables (redondemos en el caso de variables enteras)
+
+```{r, warning=FALSE}
+# Limpieza====
+cell2cell$revenue[is.na(cell2cell$revenue)] <- mean(cell2cell$revenue, na.rm = T)
+cell2cell$mou[is.na(cell2cell$mou)] <- mean(cell2cell$mou, na.rm = T)
+cell2cell$recchrge[is.na(cell2cell$recchrge)] <- mean(cell2cell$recchrge, na.rm = T)
+cell2cell$directas[is.na(cell2cell$directas)] <- mean(cell2cell$directas, na.rm = T)
+cell2cell$overage[is.na(cell2cell$overage)] <- mean(cell2cell$overage, na.rm = T)
+cell2cell$roam[is.na(cell2cell$roam)] <- mean(cell2cell$roam, na.rm = T)
+cell2cell$changem[is.na(cell2cell$changem)] <- mean(cell2cell$changem, na.rm = T)
+cell2cell$changer[is.na(cell2cell$changer)] <- mean(cell2cell$changer, na.rm = T)
+cell2cell$phones[is.na(cell2cell$phones)] <- round(mean(cell2cell$phones, na.rm = TRUE), 0)
+cell2cell$models[is.na(cell2cell$models)] <- round(mean(cell2cell$models, na.rm = TRUE), 0)
+cell2cell$eqpdays[is.na(cell2cell$eqpdays)] <- round(mean(cell2cell$eqpdays, na.rm = TRUE), 0)
+cell2cell$age1[is.na(cell2cell$age1)] <- round(mean(cell2cell$age1, na.rm = TRUE), 0)
+cell2cell$age2[is.na(cell2cell$age2)] <- round(mean(cell2cell$age2, na.rm = TRUE), 0)
+           
+```
+
+### 2. Tabula la distribución de la variable `churn`. Muestra la frecuencia absoluta y relativa. Crees que se debe hacer oversampling/undersamping?  
+
+```{r }
+cell2cell %>%
+  count(churn, name="absoluta") %>% 
+  mutate(relativa=absoluta/sum(absoluta))
+
+```
+
+La decisión de si usar Over vs Under sampling depende del tamaño de la base. En nuestro caso tenemos una base con 71047 observaciones, 50438 con churn 0 y 20609 con churn 1. Por esto, es preferible hacer Under sampling de las observaciones con churn 0, ya que no estaríamos generando información sintética.
+
+El tamaño final de la base sería de 41218, esto nos ha hecho pensar que a pesar del Under sampling la base parece ser suficiente.
+
+
+### 3. (2 pts) Divide tu base en entrenamiento y validación (80/20). Además, considera hacer oversampling (SMOTE) o undersampling. (Tip: Recuerda que el objetivo final es tener muestra ~balanceada en el traning set. En el validation la distribución debe ser la original)
+
+Hagamos undersampling para no generar información sintética. Primero generamos una 
+
+```{r }
+set.seed(13)
+# Seleciono a los que no se churnearon
+noChurneados <- cell2cell[cell2cell$churn == 0,]
+nChurneados <- sum(cell2cell$churn == 1)
+# Calculamos un PCA para poder trabajar con menos dimensiones
+pca <- princomp(noChurneados[,3:68])
+# summary(pca)
+# Nos quedamos con las primeras dimensiones que explican más del 95% de la variación
+espacio_k <- pca$scores[,1:4]
+# Clusterizo en nChurneados grupos a los no churneados
+kmeans2 <- kmeans(espacio_k, centers = nChurneados, nstart = 1)
+# Construyo una muestra
+muestra <- integer(nChurneados)
+for (iCluster in 1:nChurneados) { 
+  # Recorro los clusters y elijo a un representante de cada clase
+  reprentante <- sample(which(kmeans2$cluster == iCluster), 1)
+  muestra[iCluster] <- reprentante
+}
+
+noChurneados <- noChurneados[muestra, ]
+
+base <- rbind(
+  cell2cell[cell2cell$churn == 1,],
+  noChurneados
+)
+
+randi <- runif(nrow(base))
+
+entrenamiento <- base[randi<0.8,  ]
+validacion    <- base[randi>=0.8, ]
+
+```
+
+
+## Model estimation
+
+Pondremos a competir 3 modelos: 
+
+1. Cross-Validated LASSO-logit
+
+2. Prune Trees
+
+3. Random Forest
+
+### 4 (2 pts). Estima un cross validated LASSO. Muestra la gráfica de CV Binomial Deviance vs Complejidad
+
+```{r }
+
+Xs <- entrenamiento %>% select(-customer, -churn)
+x  <- sparse.model.matrix(~. + 0, data = Xs) # nunca he entendido por qué
+y  <- entrenamiento$churn
+
+detectCores() 
+cl <- makeCluster(4) 
+# cl
+
+lasso <- cv.gamlr(x = x, y = y, verb = T, cl = cl, family = 'binomial')
+
+stopCluster(cl)
+
+save(lasso, file = 'modelos/cv_lasso.Rdata') 
+
+plot(lasso)
+
+```
+
+### 5. Grafica el Lasso de los coeficientes vs la complejidad del modelo.   
+
+```{r }
+plot(lasso$gamlr)
+
+```
+
+
+\newpage
+
+### 6 (2 pts). Cuál es la $\lambda$ resultante? Genera una tabla con los coeficientes que selecciona el CV LASSO. Cuántas variables deja iguales a cero? Cuales son las 3 variables más importantes para predecir el abandono? Da una explicación intuitiva a la última pregunta
+
+La lambda mínima sería la siguiente
+
+```{r }
+lasso$lambda.min
+
+```
+
+Que se encuentra en el siguiente segmento
+```{r }
+lasso$seg.min
+```
+
+Podemos ver en la siguiente tabla los coeficientes para la lamba mínima. 
+* Los coeficientes más grandes son retcalls (Number of calls previously made to retention team), retcall (Customer has made made call to retention team) y retaccpt (Number of previous retention offers accepted). Estas serían las variables más importantes que explican el churneo. 
+* Se identifica que las siguientes variables son cero: blckvce, unansvce, mourec, outcalls, callfwdv, callwait, models, truck, occcler, occstud, travel y incmiss.
+
+```{r }
+coef(lasso, select='min')
+
+```
+
+### 7. Genera un data frame (usando el validation set) que tenga: `customer`, `churn` y las predicciones del LASSO. 
+
+```{r }
+# Prediciendo
+Xs <- validacion %>% select(-customer, -churn)
+x2 <- sparse.model.matrix(~. + 0, data = Xs)
+y_pred <- predict(lasso, newdata = x2, type = 'response') 
+y_pred <- as.numeric(y_pred)
+
+predicciones <- data.frame(cbind(validacion$customer, validacion$churn, y_pred))
+names(predicciones) <- c('customer', 'churn', 'lasso')
+
+```
+
+### 8. Estima ahora tree. Usa `mindev = 0.05, mincut = 1000` Cuántos nodos terminales salen? Muestra el summary del árbol
+```{r, echo=FALSE}
+entrenamiento$churn <- as.factor(entrenamiento$churn)
+entrenamiento$children <- as.factor(entrenamiento$children)
+entrenamiento$credita <- as.factor(entrenamiento$credita)
+entrenamiento$creditaa <- as.factor(entrenamiento$creditaa)
+entrenamiento$prizmrur <- as.factor(entrenamiento$prizmrur)
+entrenamiento$prizmub <- as.factor(entrenamiento$prizmub)
+entrenamiento$prizmtwn <- as.factor(entrenamiento$prizmtwn)
+entrenamiento$refurb<- as.factor(entrenamiento$refurb)
+entrenamiento$webcap <- as.factor(entrenamiento$webcap)
+entrenamiento$truck <- as.factor(entrenamiento$truck)
+entrenamiento$rv <- as.factor(entrenamiento$rv)
+entrenamiento$occprof <- as.factor(entrenamiento$occprof)
+entrenamiento$occcler <- as.factor(entrenamiento$occcler)
+entrenamiento$occcrft <- as.factor(entrenamiento$occcrft)
+entrenamiento$occstud <- as.factor(entrenamiento$occstud)
+entrenamiento$occhmkr <- as.factor(entrenamiento$occhmkr)
+entrenamiento$occret <- as.factor(entrenamiento$occret)
+entrenamiento$occself <- as.factor(entrenamiento$occself)
+entrenamiento$ownrent <- as.factor(entrenamiento$ownrent)
+entrenamiento$marryun <- as.factor(entrenamiento$marryun)
+entrenamiento$marryyes <- as.factor(entrenamiento$marryyes)
+entrenamiento$mailord<- as.factor(entrenamiento$mailord)
+entrenamiento$mailres <- as.factor(entrenamiento$mailres)
+entrenamiento$mailflag <- as.factor(entrenamiento$mailflag)
+entrenamiento$travel <- as.factor(entrenamiento$travel)
+entrenamiento$pcown <- as.factor(entrenamiento$pcown)
+entrenamiento$creditcd <- as.factor(entrenamiento$creditcd)
+entrenamiento$newcelly <- as.factor(entrenamiento$newcelly)
+entrenamiento$newcelln <- as.factor(entrenamiento$newcelln)
+entrenamiento$incmiss <- as.factor(entrenamiento$incmiss)
+entrenamiento$income <- as.factor(entrenamiento$income)
+entrenamiento$mcycle <- as.factor(entrenamiento$mcycle)
+entrenamiento$setprcm <- as.factor(entrenamiento$setprcm)
+entrenamiento$retcall <- as.factor(entrenamiento$retcall)
+```
+
+Utilizamos la función tree para estimar el primer arbol para predecir la variable churn utilizando todas las variables de la base (menos customer). El split se hace con gini, siendo una variable categórica.
+```{r }
+entrenamiento.ltr <- tree(churn ~ . -customer, 
+                          data = entrenamiento, 
+                          split = "gini", 
+                          control = tree.control(nobs = nrow(entrenamiento), 
+                                                 mincut = 1000, 
+                                                 mindev = 0.05))
+summary(entrenamiento.ltr)
+```
+Obtenemos un arbol con 27 nodos terminales. 
+
+### 9. Grafica el árbol resultante 
+```{r }
+plot(entrenamiento.ltr); text(entrenamiento.ltr)
+
+```
+Aquí se identifica que las primeras tres particiones se hacen con refer, retcalls y threeway respectivamente.
+
+
+### 10. Poda el árbol usando CV. Muestra el resultado. Grafica Tree Size vs Binomial Deviance. Cuál es el mejor tamaño del árbol? Mejora el Error?
+
+Calculamos el árbol con la función cv_tree.
+```{r }
+cv_tree<-cv.tree(entrenamiento.ltr, FUN=prune.misclass)
+cv_tree
+```
+
+Grafiquemos tree size vs binomial deviance
+
+```{r }
+plot(cv_tree$size, cv_tree$dev)
+```
+No hay un trade-off claro entre tamaño del árbol y deviance.
+
+Hagamos prunning con la función prune/tree
+
+```{r }
+#Pruning
+prt <- prune.tree(entrenamiento.ltr, method = c("misclass"), best=27)
+summary(prt)
+```
+
+### 11. Gráfica el árbol final. (Tip: Checa `prune.tree`)
+
+```{r }
+plot(prt) ; text(prt, pretty = 0)
+```
+
+### 12. Genera las predicciones del árbol pruned. Guardalas en la base de predicciones. Guarda el score y la prediccion categorica en la misma data frame donde guardaste las predicciones del LASSO
+```{r, echo=FALSE}
+validacion$churn <- as.factor(validacion$churn)
+validacion$children <- as.factor(validacion$children)
+validacion$credita <- as.factor(validacion$credita)
+validacion$creditaa <- as.factor(validacion$creditaa)
+validacion$prizmrur <- as.factor(validacion$prizmrur)
+validacion$prizmub <- as.factor(validacion$prizmub)
+validacion$prizmtwn <- as.factor(validacion$prizmtwn)
+validacion$refurb<- as.factor(validacion$refurb)
+validacion$webcap <- as.factor(validacion$webcap)
+validacion$truck <- as.factor(validacion$truck)
+validacion$rv <- as.factor(validacion$rv)
+validacion$occprof <- as.factor(validacion$occprof)
+validacion$occcler <- as.factor(validacion$occcler)
+validacion$occcrft <- as.factor(validacion$occcrft)
+validacion$occstud <- as.factor(validacion$occstud)
+validacion$occhmkr <- as.factor(validacion$occhmkr)
+validacion$occret <- as.factor(validacion$occret)
+validacion$occself <- as.factor(validacion$occself)
+validacion$ownrent <- as.factor(validacion$ownrent)
+validacion$marryun <- as.factor(validacion$marryun)
+validacion$marryyes <- as.factor(validacion$marryyes)
+validacion$mailord<- as.factor(validacion$mailord)
+validacion$mailres <- as.factor(validacion$mailres)
+validacion$mailflag <- as.factor(validacion$mailflag)
+validacion$travel <- as.factor(validacion$travel)
+validacion$pcown <- as.factor(validacion$pcown)
+validacion$creditcd <- as.factor(validacion$creditcd)
+validacion$newcelly <- as.factor(validacion$newcelly)
+validacion$newcelln <- as.factor(validacion$newcelln)
+validacion$incmiss <- as.factor(validacion$incmiss)
+validacion$income <- as.factor(validacion$income)
+validacion$mcycle <- as.factor(validacion$mcycle)
+validacion$setprcm <- as.factor(validacion$setprcm)
+validacion$retcall <- as.factor(validacion$retcall)
+```
+
+```{r }
+tree.pred <- predict(prt, newdata = validacion[, -"churn"], type = "class")
+predicciones$tree <- tree.pred
+
+tree.score <- predict(prt, newdata = validacion[, -"churn"], type = "vector")
+tree.score <- as.data.frame(tree.score)
+predicciones <- tibble(predicciones,tree.score)
+
+#Matriz de confusion
+table(tree.pred, validacion$churn)
+#Accuracy
+mean(tree.pred == validacion$churn)
+```
+Guardamos los resultados en el data frame de prediccion y calculamos el "accuracy" que es muy limitado en 54%.
+
+### 13 (4pts). Corre un Random Forest ahora. Cuál es la $B$ para la que ya no ganamos mucho más en poder predictivo?
+
+- Corre para `num.trees=100,200,300, 500, 700, 800`
+
+- En cada caso, guarda únicamente el `prediction.error`
+
+```{r}
+# Detectando los núcleos de la computadora
+detectCores()
+cl <- makeCluster(12)
+cl
+
+# Contar el tiempo de ejecución
+a <- Sys.time()
+
+# Random Forest
+#RF 100
+rf100 <- ranger(churn ~ .-customer, data = entrenamiento, classification = T,
+             num.trees = 100)
+save(rf, file = 'Modelos/rf_100.Rdata')
+
+#RF 200
+rf200 <- ranger(churn ~ .-customer, data = entrenamiento, classification = T,
+             num.trees = 200)
+save(rf, file = 'Modelos/rf_200.Rdata')
+
+#RF 300
+rf300 <- ranger(churn ~ .-customer, data = entrenamiento, classification = T,
+              num.trees = 300)
+save(rf, file = 'Modelos/rf_300.Rdata')
+
+#RF 500
+rf500 <- ranger(churn ~ .-customer, data = entrenamiento, classification = T,
+              num.trees = 500)
+save(rf, file = 'Modelos/rf_500.Rdata')
+
+#RF 700
+rf700 <- ranger(churn ~ .-customer, data = entrenamiento, classification = T,
+              num.trees = 700)
+save(rf, file = 'Modelos/rf_700.Rdata')
+
+#RF 800
+rf800 <- ranger(churn ~ .-customer, data = entrenamiento, classification = T,
+              num.trees = 800)
+save(rf, file = 'Modelos/rf_800.Rdata')
+
+Sys.time() -a
+stopCluster(cl)
+
+# Errores
+errors <- c(
+  rf100$prediction.error, rf200$prediction.error, rf300$prediction.error,
+  rf500$prediction.error, rf700$prediction.error, rf800$prediction.error
+)
+ntrees <- c(100, 200, 300, 500, 700, 800)
+error_ntrees <- tibble(errors, ntrees)
+
+# Grafico
+error_ntrees %>%
+  ggplot() +
+  geom_line(aes(x = ntrees, errors), color = "#6320EE", size = 1.2) +
+  labs(
+    fill = "j",
+    x = "Number of trees",
+    y = "Error",
+    title = ""
+  ) +
+  ggthemes::theme_clean()
+```
+La gráfica ayuda a identificar que despues de 500 árboles no ganamos mucho en cuanto a errores.
+
+
+### 14. Escoge un random forest para hacer las predicciones. Grafica la importancia de las variables. Interpreta 
+
+```{r }
+#Se elige el RF de 500 arboles
+rf <- ranger(churn ~ . - customer,
+  data = entrenamiento, classification = T,
+  write.forest = T, num.trees = 500,
+  importance = "impurity"
+)
+
+oob <- rf$predictions
+
+
+importancia_pred <- rf$variable.importance %>%
+  enframe(name = "predictor", value = "importancia")
+
+
+#Gráfico de la relevancia de las variables 
+importancia_pred %>%
+  ggplot(aes(
+    x = reorder(predictor, importancia),
+    y = importancia,
+    fill = importancia
+  )) +
+  labs(x = "predictor", title = "Importancia predictores") +
+  geom_col() +
+  coord_flip() +
+  ggthemes::theme_clean() +
+  theme(legend.position = "none")
+```
+
+
+### 15. Genera las predicciones OOS para el random forest. Guardalas en la misma data.frame que los otros modelos 
+
+```{r }
+# Prediction vectors
+pred_randomforest <- predict(rf, data = validacion)$predictions
+
+# Matriz de confusion
+table(pred_randomforest, validacion$churn)
+# Accuracy
+mean(pred_randomforest == validacion$churn)
+# Pegando resultados en data frame
+predicciones$pred_randomforest <- pred_randomforest
+
+```
+
+### 16 (2pts). Corre el mismo forest pero ahora con `probability = T`. Esto generará predicciones númericas en lugar de categóricas. Genera las predicciones continuas y guardalas en el mismo data frame
+
+```{r }
+
+#Arbol con probability "T"
+cl <- makeCluster(4)
+cl
+a <- Sys.time()
+
+rfprob <- ranger(churn ~ . - customer,
+  data = entrenamiento, classification = T,
+  num.trees = 500, importance = "impurity",
+  probability = T
+)
+Sys.time() - a
+save(rf, file = "Modelos/rf_prob.Rdata")
+stopCluster(cl)
+
+
+#Predicciones
+pred_randomforest_prob <- predict(rfprob, data = validacion)$predictions
+pred_randomforest_prob <- as.data.frame(pred_randomforest_prob)
+pred_randomforest_prob <- pred_randomforest_prob %>% 
+  rename("rf0" = "0", "rf1" = "1")
+
+predicciones <- tibble(predicciones, pred_randomforest_prob)
+
+```
+
+### 17 (4 pts). Genera graficas de las curvas ROC para los tres modelos. Cual parece ser mejor?
+
+ROC para Lasso
+
+```{r }
+predicciones$lasso_ = round(predicciones$lasso)
+roc(predicciones$churn, predicciones$lasso_, 
+    plot=TRUE, 
+    legacy.axes = TRUE,
+    percent = TRUE,
+    xlab = "Porcentaje de falsos positivos",
+    ylab = "Porcentaje de falsos negativos",
+    lwd  = 3,
+    print.auc = TRUE)
+
+```
+
+ROC para tree
+
+```{r }
+roc(predicciones$churn, as.numeric(predicciones$tree)-1, 
+    plot=TRUE, 
+    legacy.axes = TRUE,
+    percent = TRUE,
+    xlab = "Porcentaje de falsos positivos",
+    ylab = "Porcentaje de falsos negativos",
+    lwd  = 3,
+    print.auc = TRUE)
+
+```
+
+ROC para forest
+
+```{r }
+roc(predicciones$churn, as.numeric(predicciones$pred_randomforest)-1, 
+    plot=TRUE, 
+    legacy.axes = TRUE,
+    percent = TRUE,
+    xlab = "Porcentaje de falsos positivos",
+    ylab = "Porcentaje de falsos negativos",
+    lwd  = 3,
+    print.auc = TRUE)
+
+```
+
+
+### 18. Genera una tabla con el AUC ROC. Cuál es el mejor modelo ? 
+
+```{r }
+
+auc_roc <- tibble(c('Lasso','Tree','Forest'), c(0.583, 0.542, 0.642))
+names(auc_roc) <- c('Modelo','AUC ROC')
+auc_roc
+
+```
+
+¡El mejor modelo es el forest!
+
+### 19 (2pts). Escoge un punto de corte para generar predicciones categoricas para el LASSO basado en la Curva ROC. Genera las matrices de confusión para cada modelo. Compáralas. Qué tipo de error es mas pernicioso? 
+
+A partir de la curva roc del lasso podemos intuir que subir el threshold de 0.5 al lasso podrìa ayudar a mejorar el auc_roc.
+
+Vamos a calcular el auc_roc para thresholds entre 0.4 y 0.6. Al hacer 200 pasos entre estas dos cotas y calcuar el auc_roc para cada threshold, podemos ver que si elijo un threshold de 0.524 se maximiza el auc_roc.
+
+```{r }
+
+experimento <- data.frame(seq(0.4, 0.6, length=201), 0)
+names(experimento) <- c('threshold', 'auc_roc')
+for (i in 1:nrow(experimento)) {
+  nuevasPredicciones <- as.numeric(predicciones$lasso > experimento$threshold[i])
+  roki <- roc(predicciones$churn, nuevasPredicciones)
+  experimento$auc_roc[i] <- roki$auc[1]
+}
+
+
+# Vemos que un threshold de 0.524 maximiza la auc_roc
+iMaximo <- which(experimento$auc_roc==max(experimento$auc_roc))
+nuevasPredicciones <- as.numeric(predicciones$lasso > experimento$threshold[iMaximo])
+roki <- roc(predicciones$churn, nuevasPredicciones)
+experimento$auc_roc[i] <- roki$auc[1]
+
+predicciones$lasso_524 <- nuevasPredicciones
+
+```
+
+Ahora veamos la matriz de confusión del LASSO optimizado. Las filas indican la predicción, las columnas las observadas.
+
+```{r }
+#Matriz de confusion de LASSO con threshold 0.5
+table(round(predicciones$lasso), predicciones$churn)
+#Accuracy
+mean(round(predicciones$lasso) == predicciones$churn)
+```
+
+Ahora veamos la matriz de confusión del LASSO optimizado. Las filas indican la predicción, las columnas las observadas.
+
+```{r }
+#Matriz de confusion de LASSO con threshold 0.524
+table(predicciones$lasso_524, predicciones$churn)
+#Accuracy
+mean(predicciones$lasso_524 == predicciones$churn)
+```
+
+Ahora veamos la matriz de confusión del tree. Las filas indican la predicción, las columnas las observadas.
+
+```{r }
+#Matriz de confusion de LASSO con threshold 0.5
+table(predicciones$tree, predicciones$churn)
+
+```
+
+Ahora veamos la matriz de confusión del forest. Las filas indican la predicción, las columnas las observadas.
+
+```{r }
+#Matriz de confusion de LASSO con threshold 0.5
+table(predicciones$pred_randomforest, predicciones$churn)
+mean(as.numeric(predicciones$pred_randomforest==1))
+```
+
+### 20 (2pts). Finalmente, construye una lift table. Esto es, para 20 grupos del score predecido, genera 1) El promedio de las predicciones, 2) el promedio del churn observado. Existe monotonía? El mejor algoritmo es monotónico? (Tip: usa `ntile` para generar los grupos a partir de las predicciones)
+
+Separamos en 20 grupos. Calculamos la media por cada grupo para cada modelo a continuación.
+
+No se observa monotonía para ningún modelo.
+
+```{r }
+grupos <- predicciones$customer %>% 
+  dplyr::ntile(20)  
+
+lift <- data.frame(seq(1,20))
+names(lift) <- c('grupo')
+lift$m_observada <- 0
+lift$m_pred_lasso <- 0
+lift$m_pred_tree <- 0
+lift$m_pred_forest <- 0
+
+for (i in seq(1,20)) {
+  iGrupo <- grupos == i
+  lift$m_observada[i] <- mean(predicciones$churn[iGrupo])
+  lift$m_pred_lasso[i] <- mean(predicciones$lasso_524[iGrupo])
+  lift$m_pred_tree[i] <- mean(as.numeric(predicciones$tree)[iGrupo]-1)
+  lift$m_pred_forest[i] <- mean(as.numeric(predicciones$pred_randomforest)[iGrupo]-1)
+}
+
+lift %>% kbl()
+
+```
+
+
+### 21. Concluye. Que estrategia harías con este modelo? Cómo generarías valor a partir de el?
+
+La principal posibilidad para generar valor es poder construir campañas de seguimiento y marketing con aquellos individuos que se identifiquen como un posible churneador.
+
+Además, con el modelo lasso identificamos las tres variables más relevantes para explicar el abandono, en este caso dichas variables son retcalls (Number of calls previously made to retention team), retcall (Customer has made made call to retention team) y retaccpt (Number of previous retention offers accepted).
+
+Podemos ver que el retention team es muy relevante en términos de churns positivos, por lo que una forma de generar valor sería sugerir reforzar las estrategias y proyectos en esta área.
+
+De manera complementaria, se podrìa realizar un anàlisis de cuàles son las caracterìsticas principales de los grupos que abandonan para hacer targeting de promociones con ellos.
+
+
+
+
+
+
